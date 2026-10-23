@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+*.db
+*.sqlite
+*.sqlite3
+*.backup
+*.zip
+.ipynb_checkpoints/
