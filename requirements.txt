@@ -1,4 +1,6 @@
+
 gradio
+requests
 psycopg[binary]
 
 
