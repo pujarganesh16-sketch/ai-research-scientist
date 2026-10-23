@@ -1,4 +1,14 @@
+
+
 # AI Research Scientist
+
+Explore academic research papers using arXiv.
+
+## Live Demo
+
+🚀 **Try the application here:**
+
+[Open AI Research Scientist](https://ai-research-scientist-2.onrender.com)
 
 A Python and SQLite research workspace designed to organize research papers, manage evidence, track experiments, and support systematic research.
 
