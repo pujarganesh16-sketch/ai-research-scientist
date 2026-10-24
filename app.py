@@ -19,7 +19,6 @@ import os
 import re
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,8 +42,8 @@ except ImportError:
 
 APP_NAME = "AI Research Scientist"
 APP_VERSION = "3.0.0"
-ARXIV_API = "https://export.arxiv.org/api/query"
-ATOM = {"a": "http://www.w3.org/2005/Atom"}
+OPENALEX_API = "https://api.openalex.org/works"
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -111,10 +110,12 @@ def escape(value: Any) -> str:
 
 
 def safe_arxiv_url(value: str) -> str:
+    """Validate external source URLs (kept under this name for DB compatibility)."""
     parsed = urlparse(value or "")
-    if parsed.scheme in {"https", "http"} and parsed.netloc in {"arxiv.org", "export.arxiv.org"}:
+    allowed = {"openalex.org", "doi.org", "www.doi.org", "arxiv.org", "export.arxiv.org", "pubmed.ncbi.nlm.nih.gov"}
+    if parsed.scheme == "https" and (parsed.netloc in allowed or parsed.netloc.endswith(".openalex.org")):
         return value
-    return "https://arxiv.org/"
+    return "https://openalex.org/"
 
 
 def normalize_query(value: str) -> str:
@@ -124,45 +125,71 @@ def normalize_query(value: str) -> str:
     return value
 
 
-def arxiv_expression(query: str, field: str) -> str:
-    # Escape quotes and backslashes so user text cannot accidentally break the API expression.
-    q = query.replace("\\", " ").replace('"', " ").strip()
-    field_code = {
-        "All fields": "all",
-        "Title": "ti",
-        "Author": "au",
-        "Abstract": "abs",
-    }.get(field, "all")
-    return f'{field_code}:"{q}"' if field_code != "all" else f'all:"{q}"'
+def reconstruct_abstract(inverted_index: dict[str, list[int]] | None) -> str:
+    if not isinstance(inverted_index, dict):
+        return ""
+    positions = {}
+    for word, indexes in inverted_index.items():
+        for index in indexes if isinstance(indexes, list) else []:
+            if isinstance(index, int) and 0 <= index < 100000:
+                positions[index] = word
+    return " ".join(positions[i] for i in sorted(positions))[:MAX_ABSTRACT_CHARS]
 
 
-def parse_arxiv(xml_bytes: bytes) -> list[Paper]:
-    root = ET.fromstring(xml_bytes)
+def parse_openalex(payload: dict[str, Any]) -> list[Paper]:
     papers: list[Paper] = []
-    for entry in root.findall("a:entry", ATOM):
-        title = " ".join((entry.findtext("a:title", "", ATOM) or "").split())
-        abstract = " ".join((entry.findtext("a:summary", "", ATOM) or "").split())
-        url = safe_arxiv_url(entry.findtext("a:id", "", ATOM) or "")
-        published = (entry.findtext("a:published", "", ATOM) or "")[:10]
-        updated = (entry.findtext("a:updated", "", ATOM) or "")[:10]
-        authors = tuple(
-            " ".join((author.findtext("a:name", "", ATOM) or "").split())
-            for author in entry.findall("a:author", ATOM)
-            if (author.findtext("a:name", "", ATOM) or "").strip()
-        )
-        categories = tuple(
-            c.attrib["term"] for c in entry.findall("a:category", ATOM)
-            if c.attrib.get("term")
-        )
-        doi = ""
-        for link in entry.findall("a:link", ATOM):
-            if link.attrib.get("title", "").lower() == "doi":
-                doi = link.attrib.get("href", "")
-                break
+    for item in payload.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or "Untitled paper").split())
+        authors = []
+        for authorship in item.get("authorships") or []:
+            author = (authorship.get("author") or {}).get("display_name")
+            if author:
+                authors.append(str(author))
+        date = str(item.get("publication_date") or "")[:10]
+        updated = str(item.get("updated_date") or "")[:10]
+        landing = (item.get("primary_location") or {}).get("landing_page_url")
+        doi_raw = item.get("doi") or ""
+        doi = str(doi_raw).replace("https://doi.org/", "") if doi_raw else ""
+        url = landing or (f"https://doi.org/{doi}" if doi else item.get("id") or "https://openalex.org/")
+        categories = []
+        for concept in (item.get("topics") or [])[:8]:
+            name = concept.get("display_name") if isinstance(concept, dict) else None
+            if name:
+                categories.append(str(name))
+        if not categories:
+            for concept in (item.get("concepts") or [])[:5]:
+                name = concept.get("display_name") if isinstance(concept, dict) else None
+                if name:
+                    categories.append(str(name))
+        abstract = reconstruct_abstract(item.get("abstract_inverted_index"))
         if title:
-            papers.append(Paper(title, authors, abstract[:MAX_ABSTRACT_CHARS], url,
-                                published, updated, categories, doi))
+            papers.append(Paper(title, tuple(authors), abstract, safe_arxiv_url(str(url)), date, updated, tuple(categories), doi))
     return papers
+
+
+def openalex_search_params(query: str, field: str, sort: str, limit: int) -> dict[str, Any]:
+    params: dict[str, Any] = {"search": query, "per-page": limit, "mailto": os.getenv("CONTACT_EMAIL", "")}
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
+    if field == "Title":
+        params["filter"] = "title.search:" + query
+        params.pop("search", None)
+    elif field == "Author":
+        params["filter"] = "authorships.author.display_name.search:" + query
+        params.pop("search", None)
+    if sort == "Newest first":
+        params["sort"] = "publication_date:desc"
+    return {k: v for k, v in params.items() if v not in (None, "")}
+
+
+def request_openalex(params: dict[str, Any]) -> dict[str, Any]:
+    response = SESSION.get(OPENALEX_API, params=params, timeout=(8, 40))
+    response.raise_for_status()
+    if len(response.content) > 15_000_000:
+        raise RuntimeError("The OpenAlex response was unexpectedly large.")
+    return response.json()
 
 
 def db_connect():
@@ -212,14 +239,6 @@ def save_search(query: str, field: str, count: int, elapsed_ms: int) -> None:
         log.exception("Unable to save search history; search results remain available")
 
 
-def request_arxiv(params: dict[str, Any]) -> bytes:
-    response = SESSION.get(ARXIV_API, params=params, timeout=(8, 40))
-    response.raise_for_status()
-    if len(response.content) > 12_000_000:
-        raise RuntimeError("The arXiv response was unexpectedly large.")
-    return response.content
-
-
 def perform_search(query: str, field: str, sort: str, limit: int):
     start = time.monotonic()
     query = normalize_query(query)
@@ -229,46 +248,42 @@ def perform_search(query: str, field: str, sort: str, limit: int):
         limit = max(1, min(int(limit), MAX_RESULTS))
     except (ValueError, TypeError):
         limit = 10
-    params = {
-        "search_query": arxiv_expression(query, field),
-        "start": 0,
-        "max_results": limit,
-        "sortBy": "submittedDate" if sort == "Newest first" else "relevance",
-        "sortOrder": "descending",
-    }
+    params = openalex_search_params(query, field, sort, limit)
     try:
-        xml_bytes = request_arxiv(params)
-        papers = parse_arxiv(xml_bytes)
+        payload = request_openalex(params)
+        papers = parse_openalex(payload)
         elapsed = int((time.monotonic() - start) * 1000)
         save_search(query, field, len(papers), elapsed)
         if papers:
-            status = f"**{len(papers)} papers found** · {elapsed / 1000:.1f}s · Search field: {escape(field)}"
+            status = f"**{len(papers)} papers found** · {elapsed / 1000:.1f}s · Source: OpenAlex · Search field: {escape(field)}"
         else:
             status = "No papers found. Try shorter or broader keywords."
-        log.info("Search completed: field=%s count=%d elapsed_ms=%d", field, len(papers), elapsed)
+        log.info("OpenAlex search completed: field=%s count=%d elapsed_ms=%d", field, len(papers), elapsed)
         return papers, status, elapsed
     except requests.Timeout:
-        log.warning("arXiv timed out")
-        return [], "arXiv timed out. Wait a moment and retry; the external service may be busy.", 0
+        log.warning("OpenAlex timed out")
+        return [], "OpenAlex timed out. Wait a moment and retry; the external service may be busy.", 0
     except requests.HTTPError as exc:
         code = exc.response.status_code if exc.response is not None else "unknown"
-        log.warning("arXiv HTTP error: %s", code)
+        log.warning("OpenAlex HTTP error: %s", code)
         if code == 429:
-            message = "arXiv is rate-limiting requests. Please wait briefly before trying again."
+            message = "OpenAlex is rate-limiting requests. Please wait briefly before trying again."
+        elif code in (401, 403):
+            message = "OpenAlex rejected the API key. Check OPENALEX_API_KEY in Render Environment."
         else:
-            message = f"arXiv returned an HTTP error ({code}). Please retry later."
+            message = f"OpenAlex returned an HTTP error ({code}). Please retry later."
         return [], message, 0
     except requests.RequestException:
-        log.exception("Network error contacting arXiv")
-        return [], "Could not reach arXiv. Check your connection or try again later.", 0
-    except ET.ParseError:
-        log.exception("Malformed XML received from arXiv")
-        return [], "arXiv returned data that could not be parsed. Please try again later.", 0
+        log.exception("Network error contacting OpenAlex")
+        return [], "Could not reach OpenAlex from the server. Check Render logs and try again later.", 0
+    except (ValueError, json.JSONDecodeError):
+        log.exception("Invalid JSON received from OpenAlex")
+        return [], "OpenAlex returned data that could not be read. Please retry later.", 0
     except ValueError as exc:
         return [], escape(str(exc)), 0
     except Exception:
         log.exception("Unexpected search failure")
-        return [], "An unexpected error occurred. Check service logs if the issue continues.", 0
+        return [], "An unexpected search error occurred. Check Render logs for details.", 0
 
 
 def render_papers(papers: list[Paper]) -> str:
@@ -336,7 +351,7 @@ def build_analysis(papers: list[Paper], query: str) -> str:
         f"| Distinct authors in result set | {unique_authors} |\n"
         f"| Category entropy | {entropy_bits(papers):.2f} bits |\n\n"
         f"**Frequent terms**\n\n{terms}\n\n"
-        f"**Frequent arXiv categories**\n\n{top_cats}\n\n"
+        f"**Frequent research topics**\n\n{top_cats}\n\n"
         "> Interpretation note: category entropy measures how broadly category labels are distributed; "
         "word counts describe the returned text. Neither metric proves quality, novelty, causation, or consensus."
     )
@@ -424,7 +439,7 @@ def export_bibtex(papers: list[Paper]):
         def b(v: str) -> str:
             return str(v or "").replace("\\", r"\textbackslash{}").replace("{", r"\{").replace("}", r"\}").replace("&", r"\&").replace("%", r"\%").replace("_", r"\_")
         year = p.published[:4] if p.published else ""
-        entries.append(f"@misc{{{key},\n  title = {{{b(p.title)}}},\n  author = {{{b(' and '.join(p.authors))}}},\n  year = {{{year}}},\n  howpublished = {{arXiv}},\n  url = {{{safe_arxiv_url(p.url)}}}\n}}")
+        entries.append(f"@misc{{{key},\n  title = {{{b(p.title)}}},\n  author = {{{b(' and '.join(p.authors))}}},\n  year = {{{year}}},\n  howpublished = {{OpenAlex}},\n  url = {{{safe_arxiv_url(p.url)}}}\n}}")
     with open(path, "w", encoding="utf-8") as file:
         file.write("\n\n".join(entries) + "\n")
     return path
@@ -448,7 +463,6 @@ def database_status() -> str:
     except Exception:
         log.exception("Database health check failed")
         return "Neon connection failed. Verify DATABASE_URL in Render environment settings; do not share it publicly."
-
 
 def history_text() -> str:
     if not DATABASE_URL or psycopg is None:
@@ -475,7 +489,7 @@ def ai_summary(papers: list[Paper], query: str) -> str:
         return "Search for papers first."
     if OpenAI is None or not OPENAI_API_KEY:
         return "AI synthesis is optional and not enabled. Add `OPENAI_API_KEY` in Render and include the `openai` package to enable it. Current analysis is deterministic text statistics, not an AI-generated summary."
-    # Bound input and result size; only summarize abstracts actually returned by arXiv.
+    # Bound input and result size; only summarize abstracts actually returned by OpenAlex.
     source = "\n\n".join(f"TITLE: {p.title}\nABSTRACT: {p.abstract[:1800]}\nSOURCE: {safe_arxiv_url(p.url)}" for p in papers[:8])
     try:
         client = OpenAI(api_key=OPENAI_API_KEY, timeout=35, max_retries=1)
@@ -485,7 +499,7 @@ def ai_summary(papers: list[Paper], query: str) -> str:
                 "You are a careful research assistant. Summarize only evidence in the supplied paper titles and abstracts. "
                 "Do not invent methods, results, citations, or consensus. Clearly label uncertainty and missing details. "
                 "Use sections: Common themes, Differences, Evidence limitations, Follow-up questions. "
-                "Cite claims inline using the supplied arXiv URLs. If abstracts do not support a claim, say so.\n\n"
+                "Cite claims inline using the supplied source URLs. If abstracts do not support a claim, say so.\n\n"
                 f"User research topic: {query[:MAX_QUERY_CHARS]}\n\nPapers:\n{source}"
             ),
             max_output_tokens=900,
@@ -535,7 +549,7 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
         '<header id="hero"><p class="eyebrow">Academic intelligence workspace · v3.0</p>'
         '<h1>AI Research Scientist</h1>'
         '<p>Explore scholarly literature, inspect source abstracts, compare studies, quantify the research landscape, and export citations in a polished workspace.</p>'
-        '<div class="hero-meta"><span>arXiv discovery</span><span>Research analytics</span><span>CSV + BibTeX</span><span>Optional Neon library</span></div></header>'
+        '<div class="hero-meta"><span>OpenAlex discovery</span><span>Research analytics</span><span>CSV + BibTeX</span><span>Optional Neon library</span></div></header>'
     )
     with gr.Group(elem_classes=["search-panel"]):
         query = gr.Textbox(label="Research topic", placeholder="e.g., robust machine learning for medical imaging", lines=1, max_lines=2)
@@ -575,7 +589,7 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
         db_output = gr.Markdown("")
         history_output = gr.Markdown("")
         library_output = gr.Markdown("")
-    gr.Markdown("**Research integrity:** Metadata and abstracts are supplied by arXiv. Analytics are descriptive, not a scientific quality score. Verify methods and conclusions in original papers. External APIs and hosting providers can occasionally be unavailable.")
+    gr.Markdown("**Research integrity:** Metadata and abstracts are supplied by OpenAlex; abstracts are not available for every record. Analytics are descriptive, not a scientific quality score. Verify methods and conclusions in original papers. External APIs and hosting providers can occasionally be unavailable.")
 
     def run_ui(q, f, s, n):
         papers, message, _elapsed = perform_search(q, f, s, n)
@@ -610,3 +624,4 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", "7860")),
     )
+      
