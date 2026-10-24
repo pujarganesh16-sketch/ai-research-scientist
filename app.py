@@ -464,6 +464,7 @@ def database_status() -> str:
         log.exception("Database health check failed")
         return "Neon connection failed. Verify DATABASE_URL in Render environment settings; do not share it publicly."
 
+
 def history_text() -> str:
     if not DATABASE_URL or psycopg is None:
         return "Configure Neon to view persistent search history."
@@ -594,7 +595,7 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
     def run_ui(q, f, s, n):
         papers, message, _elapsed = perform_search(q, f, s, n)
         choices = [(f"{i+1}. {p.title[:115]}", p.url) for i, p in enumerate(papers)]
-        return papers, message, render_papers(papers), build_analysis(papers, q), gr.update(choices=choices, value=[]), [], "Select at least two papers.", "", "", ""
+        return papers, message, render_papers(papers), build_analysis(papers, q), gr.update(choices=choices, value=[]), [], "Select at least two papers.", "", "", None
 
     search_outputs = [papers_state, status, papers_html, analytics, paper_choices, chosen_state, comparison, bookmark_status, ai_output, csv_output]
     search_button.click(run_ui, inputs=[query, field, sort, limit], outputs=search_outputs)
