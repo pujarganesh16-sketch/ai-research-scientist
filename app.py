@@ -724,6 +724,928 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace") as demo:
                 [], "Select at least two papers.", "", "", None, None, None, None)
     clear_button.click(reset_ui, outputs=[query, papers_state, status, papers_html, analytics, paper_choices, chosen_state, comparison, bookmark_status, ai_output, csv_output, bib_output, ris_output, json_output])
 
+
+# ---------------------------------------------------------------------------
+# Research intelligence utilities
+# ---------------------------------------------------------------------------
+# These helpers are deliberately pure (no network or database calls). Keeping
+# analysis functions deterministic makes them easier to test and safer to use
+# inside a queued web application.
+
+
+def normalize_whitespace(value: Any) -> str:
+    """Return a stable, printable, whitespace-normalized string."""
+    if value is None:
+        return ""
+    text = str(value).replace("\x00", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_doi(value: Any) -> str:
+    """Normalize a DOI from bare, doi.org, or doi: prefixed forms."""
+    doi = normalize_whitespace(value)
+    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I)
+    doi = re.sub(r"^doi:\s*", "", doi, flags=re.I)
+    return doi.strip().rstrip(".,;)")
+
+
+def doi_url(value: Any) -> str:
+    """Return a safe canonical DOI URL, or an empty string when invalid."""
+    doi = normalize_doi(value)
+    if not doi or not re.match(r"^10\.\d{4,9}/\S+$", doi, flags=re.I):
+        return ""
+    if any(ch in doi for ch in "<>\"' "):
+        return ""
+    from urllib.parse import quote
+    return "https://doi.org/" + quote(doi, safe="/().;:_-")
+
+
+def paper_fingerprint(paper: Paper) -> str:
+    """Build a stable duplicate-detection key, preferring a DOI when present."""
+    doi = normalize_doi(paper.doi).casefold()
+    if doi:
+        return "doi:" + doi
+    title = normalize_whitespace(paper.title).casefold()
+    title = re.sub(r"[^a-z0-9]+", " ", title).strip()
+    year = str(paper.year or "")
+    return f"title:{title}|year:{year}"
+
+
+def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
+    """Preserve result order while dropping records with the same fingerprint."""
+    seen: set[str] = set()
+    unique: list[Paper] = []
+    for paper in papers:
+        key = paper_fingerprint(paper)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(paper)
+    return unique
+
+
+def paper_completeness(paper: Paper) -> dict[str, bool]:
+    """Report which useful bibliographic fields are available for a record."""
+    return {
+        "title": bool(normalize_whitespace(paper.title)),
+        "authors": bool(paper.authors),
+        "abstract": bool(normalize_whitespace(paper.abstract)),
+        "publication_date": bool(paper.published),
+        "source_url": bool(safe_arxiv_url(paper.url)),
+        "doi": bool(normalize_doi(paper.doi)),
+        "topics": bool(paper.categories),
+    }
+
+
+def completeness_score(paper: Paper) -> float:
+    """Calculate a transparent metadata completeness percentage (not quality)."""
+    fields = paper_completeness(paper)
+    return round(100 * sum(fields.values()) / max(1, len(fields)), 1)
+
+
+def average_completeness(papers: list[Paper]) -> float:
+    """Average metadata completeness across a result set."""
+    if not papers:
+        return 0.0
+    return round(sum(completeness_score(p) for p in papers) / len(papers), 1)
+
+
+def reading_minutes(text: Any, words_per_minute: int = 220) -> int:
+    """Estimate reading time from abstract length; this is only a rough guide."""
+    safe_wpm = max(80, min(int(words_per_minute or 220), 600))
+    words = len(normalize_whitespace(text).split())
+    return max(1, math.ceil(words / safe_wpm)) if words else 0
+
+
+def abstract_preview(text: Any, limit: int = 280) -> str:
+    """Create a plain-text preview without cutting in the middle of a word."""
+    text = normalize_whitespace(text)
+    limit = max(40, min(int(limit or 280), 2000))
+    if len(text) <= limit:
+        return text
+    shortened = text[: limit + 1]
+    if " " in shortened:
+        shortened = shortened.rsplit(" ", 1)[0]
+    return shortened.rstrip(" .,:;-") + "…"
+
+
+def title_words(paper: Paper) -> set[str]:
+    """Extract useful title tokens for transparent overlap comparisons."""
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9-]{2,}", paper.title.lower())
+    return {token for token in tokens if token not in STOPWORDS}
+
+
+def jaccard_similarity(left: set[str], right: set[str]) -> float:
+    """Compute Jaccard similarity for two token sets, in the range 0..1."""
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def title_overlap_matrix(papers: list[Paper]) -> list[list[float]]:
+    """Return pairwise title-token overlap; diagonal entries are 1 for nonempty titles."""
+    token_sets = [title_words(paper) for paper in papers]
+    matrix: list[list[float]] = []
+    for i, left in enumerate(token_sets):
+        row = []
+        for j, right in enumerate(token_sets):
+            row.append(1.0 if i == j and left else jaccard_similarity(left, right))
+        matrix.append(row)
+    return matrix
+
+
+def year_distribution(papers: list[Paper]) -> list[tuple[int, int]]:
+    """Count publication years and return them in chronological order."""
+    counts = Counter(p.year for p in papers if p.year is not None)
+    return sorted(counts.items())
+
+
+def author_productivity(papers: list[Paper], limit: int = 10) -> list[tuple[str, int]]:
+    """Count authors within the current result set, not across all scholarship."""
+    counts = Counter(author for paper in papers for author in paper.authors if author)
+    return counts.most_common(max(1, min(int(limit or 10), 50)))
+
+
+def topic_distribution(papers: list[Paper], limit: int = 12) -> list[tuple[str, int]]:
+    """Count source-provided topics/categories in the current result set."""
+    counts = Counter(category for paper in papers for category in paper.categories if category)
+    return counts.most_common(max(1, min(int(limit or 12), 50)))
+
+
+def abstract_coverage(papers: list[Paper]) -> float:
+    """Return the percentage of records that include an abstract."""
+    if not papers:
+        return 0.0
+    return round(100 * sum(bool(p.abstract.strip()) for p in papers) / len(papers), 1)
+
+
+def doi_coverage(papers: list[Paper]) -> float:
+    """Return the percentage of records with a DOI value."""
+    if not papers:
+        return 0.0
+    return round(100 * sum(bool(normalize_doi(p.doi)) for p in papers) / len(papers), 1)
+
+
+def date_coverage(papers: list[Paper]) -> float:
+    """Return the percentage of records with a four-digit publication year."""
+    if not papers:
+        return 0.0
+    return round(100 * sum(p.year is not None for p in papers) / len(papers), 1)
+
+
+def result_set_summary(papers: list[Paper]) -> dict[str, Any]:
+    """Produce a compact, serializable overview for dashboard components."""
+    years = [year for year, _count in year_distribution(papers)]
+    return {
+        "count": len(papers),
+        "unique_authors": len({a for p in papers for a in p.authors}),
+        "year_min": min(years) if years else None,
+        "year_max": max(years) if years else None,
+        "abstract_coverage_percent": abstract_coverage(papers),
+        "doi_coverage_percent": doi_coverage(papers),
+        "date_coverage_percent": date_coverage(papers),
+        "metadata_completeness_percent": average_completeness(papers),
+        "year_distribution": year_distribution(papers),
+        "top_authors": author_productivity(papers, 8),
+        "top_topics": topic_distribution(papers, 8),
+    }
+
+
+def filter_by_year(papers: list[Paper], start_year: int | None = None,
+                   end_year: int | None = None) -> list[Paper]:
+    """Filter a result list by inclusive publication-year bounds."""
+    if start_year is not None and end_year is not None and start_year > end_year:
+        raise ValueError("Start year must be less than or equal to end year.")
+    filtered = []
+    for paper in papers:
+        year = paper.year
+        if year is None:
+            continue
+        if start_year is not None and year < start_year:
+            continue
+        if end_year is not None and year > end_year:
+            continue
+        filtered.append(paper)
+    return filtered
+
+
+def filter_by_author(papers: list[Paper], fragment: str) -> list[Paper]:
+    """Case-insensitive author substring filter for an already-fetched result set."""
+    needle = normalize_whitespace(fragment).casefold()
+    if not needle:
+        return list(papers)
+    return [p for p in papers if any(needle in author.casefold() for author in p.authors)]
+
+
+def filter_by_topic(papers: list[Paper], fragment: str) -> list[Paper]:
+    """Case-insensitive category/topic substring filter."""
+    needle = normalize_whitespace(fragment).casefold()
+    if not needle:
+        return list(papers)
+    return [p for p in papers if any(needle in topic.casefold() for topic in p.categories)]
+
+
+def filter_with_abstract(papers: list[Paper], required: bool = True) -> list[Paper]:
+    """Keep records with or without abstracts, depending on the requested mode."""
+    return [p for p in papers if bool(p.abstract.strip()) is bool(required)]
+
+
+def sort_papers_locally(papers: list[Paper], mode: str) -> list[Paper]:
+    """Sort already-fetched results without another API request."""
+    if mode == "Newest first":
+        return sorted(papers, key=lambda p: (p.published or "", p.title.casefold()), reverse=True)
+    if mode == "Title A–Z":
+        return sorted(papers, key=lambda p: p.title.casefold())
+    if mode == "Most authors":
+        return sorted(papers, key=lambda p: (len(p.authors), p.title.casefold()), reverse=True)
+    if mode == "Abstract available":
+        return sorted(papers, key=lambda p: (bool(p.abstract), len(p.abstract)), reverse=True)
+    return list(papers)
+
+
+def search_text_matches(paper: Paper, query: str) -> bool:
+    """Check whether every query token appears in available local paper text."""
+    terms = [term.casefold() for term in normalize_whitespace(query).split()]
+    haystack = " ".join((paper.title, paper.abstract, paper.author_text,
+                         " ".join(paper.categories))).casefold()
+    return all(term in haystack for term in terms)
+
+
+def local_text_filter(papers: list[Paper], query: str) -> list[Paper]:
+    """Filter already-fetched papers without implying full-database coverage."""
+    if not normalize_whitespace(query):
+        return list(papers)
+    return [paper for paper in papers if search_text_matches(paper, query)]
+
+
+def citation_author_label(authors: tuple[str, ...], maximum: int = 3) -> str:
+    """Return a compact author label suitable for an informal citation preview."""
+    names = [normalize_whitespace(a) for a in authors if normalize_whitespace(a)]
+    if not names:
+        return "Unknown author"
+    if len(names) <= maximum:
+        return ", ".join(names)
+    return ", ".join(names[:maximum]) + ", et al."
+
+
+def citation_year_label(paper: Paper) -> str:
+    """Return a year label that does not invent missing publication dates."""
+    return str(paper.year) if paper.year is not None else "n.d."
+
+
+def apa_like_reference(paper: Paper) -> str:
+    """Build a readable APA-like reference preview; not a formal style validator."""
+    author = citation_author_label(paper.authors)
+    year = citation_year_label(paper)
+    title = normalize_whitespace(paper.title).rstrip(".")
+    doi = doi_url(paper.doi)
+    base = f"{author} ({year}). {title}."
+    return f"{base} {doi}" if doi else base
+
+
+def markdown_reference_list(papers: list[Paper]) -> str:
+    """Render a Markdown bibliography with escaped user-visible content."""
+    if not papers:
+        return "No papers are available to cite yet."
+    return "\n\n".join(f"{index}. {escape(apa_like_reference(paper))}"
+                          for index, paper in enumerate(papers, 1))
+
+
+def keyword_cooccurrence(papers: list[Paper], top_n: int = 20) -> list[tuple[str, str, int]]:
+    """Count co-occurring frequent title terms within the same paper."""
+    per_paper = []
+    global_counts = Counter()
+    for paper in papers:
+        words = title_words(paper)
+        per_paper.append(words)
+        global_counts.update(words)
+    selected = {word for word, _count in global_counts.most_common(max(2, top_n))}
+    pairs: Counter[tuple[str, str]] = Counter()
+    for words in per_paper:
+        ordered = sorted(words & selected)
+        for i, first in enumerate(ordered):
+            for second in ordered[i + 1:]:
+                pairs[(first, second)] += 1
+    return [(a, b, count) for (a, b), count in pairs.most_common(50)]
+
+
+def author_collaboration_edges(papers: list[Paper], maximum_authors_per_paper: int = 12) -> list[tuple[str, str, int]]:
+    """Summarize co-authorship edges observed in the current result set."""
+    edges: Counter[tuple[str, str]] = Counter()
+    for paper in papers:
+        authors = sorted(set(paper.authors[:max(2, maximum_authors_per_paper)]))
+        for index, first in enumerate(authors):
+            for second in authors[index + 1:]:
+                edges[(first, second)] += 1
+    return [(a, b, n) for (a, b), n in edges.most_common(100)]
+
+
+def result_quality_notes(papers: list[Paper]) -> list[str]:
+    """Generate cautious metadata observations, never quality judgments."""
+    if not papers:
+        return ["Run a search before evaluating metadata coverage."]
+    notes = []
+    abstract_pct = abstract_coverage(papers)
+    doi_pct = doi_coverage(papers)
+    date_pct = date_coverage(papers)
+    if abstract_pct < 50:
+        notes.append("Fewer than half of these records include abstracts; inspect publisher pages for context.")
+    elif abstract_pct < 90:
+        notes.append("Some records lack abstracts, so text-based comparisons may be incomplete.")
+    else:
+        notes.append("Most records include abstracts, supporting a more informative first-pass review.")
+    if doi_pct < 50:
+        notes.append("DOI coverage is limited in this result set; use source links to verify individual records.")
+    if date_pct < 90:
+        notes.append("Some publication dates are unavailable; year-based analysis excludes undated records.")
+    notes.append("Metadata completeness is not a measure of scientific rigor or trustworthiness.")
+    return notes
+
+
+def safe_filename(label: str, extension: str, max_stem: int = 64) -> str:
+    """Create a conservative filename for generated downloads."""
+    stem = normalize_whitespace(label).lower()
+    stem = re.sub(r"[^a-z0-9]+", "-", stem).strip("-")
+    stem = (stem or "research-export")[:max(12, min(max_stem, 120))].strip("-")
+    ext = re.sub(r"[^a-z0-9]", "", (extension or "txt").lower())[:8] or "txt"
+    return f"{stem}.{ext}"
+
+
+def bounded_integer(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """Parse an integer input and clamp it to an explicit safe range."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def parse_year_input(value: Any) -> int | None:
+    """Parse a year-like input; blank values mean no bound."""
+    if value is None or normalize_whitespace(value) == "":
+        return None
+    year = bounded_integer(value, -1, 1000, 2200)
+    if year == -1:
+        raise ValueError("Enter a valid year between 1000 and 2200.")
+    return year
+
+
+def validate_result_limit(value: Any) -> int:
+    """Normalize user-provided result counts to the app's supported range."""
+    return bounded_integer(value, 10, 1, MAX_RESULTS)
+
+
+def safe_markdown_text(value: Any) -> str:
+    """Escape raw HTML and normalize line breaks for a plain Markdown label."""
+    text = normalize_whitespace(value)
+    return escape(text).replace("|", "\\|")
+
+
+def compact_paper_record(paper: Paper) -> dict[str, Any]:
+    """Serialize a Paper to a stable, JSON-compatible public record."""
+    return {
+        "title": paper.title,
+        "authors": list(paper.authors),
+        "abstract": paper.abstract,
+        "url": safe_arxiv_url(paper.url),
+        "published": paper.published,
+        "updated": paper.updated,
+        "categories": list(paper.categories),
+        "doi": normalize_doi(paper.doi),
+        "year": paper.year,
+        "metadata_completeness_percent": completeness_score(paper),
+    }
+
+
+def compact_result_records(papers: list[Paper]) -> list[dict[str, Any]]:
+    """Serialize a complete result set for downstream analysis and testing."""
+    return [compact_paper_record(paper) for paper in papers]
+
+
+def result_set_signature(papers: list[Paper]) -> str:
+    """Return a deterministic short signature for a result set, not a security token."""
+    import hashlib
+    payload = "\n".join(paper_fingerprint(p) for p in papers).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def compare_metadata(left: Paper, right: Paper) -> dict[str, Any]:
+    """Return a transparent side-by-side metadata comparison."""
+    return {
+        "same_doi": bool(normalize_doi(left.doi)) and normalize_doi(left.doi).casefold() == normalize_doi(right.doi).casefold(),
+        "title_similarity": round(jaccard_similarity(title_words(left), title_words(right)), 3),
+        "shared_authors": sorted(set(left.authors) & set(right.authors)),
+        "shared_topics": sorted(set(left.categories) & set(right.categories)),
+        "year_difference": abs(left.year - right.year) if left.year and right.year else None,
+        "both_have_abstracts": bool(left.abstract.strip()) and bool(right.abstract.strip()),
+    }
+
+
+def duplicate_groups(papers: list[Paper]) -> list[list[Paper]]:
+    """Find groups with matching normalized DOI/title-year fingerprints."""
+    groups: dict[str, list[Paper]] = {}
+    for paper in papers:
+        groups.setdefault(paper_fingerprint(paper), []).append(paper)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def research_landscape_report(papers: list[Paper], query: str = "") -> str:
+    """Create a plain-text summary suitable for download or copy/paste."""
+    summary = result_set_summary(papers)
+    lines = [f"Research landscape report: {normalize_whitespace(query) or 'Unspecified topic'}",
+             "=" * 68,
+             f"Records in current result set: {summary['count']}",
+             f"Distinct listed authors: {summary['unique_authors']}",
+             f"Abstract coverage: {summary['abstract_coverage_percent']}%",
+             f"DOI coverage: {summary['doi_coverage_percent']}%",
+             f"Metadata completeness: {summary['metadata_completeness_percent']}%"]
+    if summary["year_min"] is not None:
+        lines.append(f"Publication years represented: {summary['year_min']}–{summary['year_max']}")
+    lines.append("")
+    lines.append("Interpretation cautions:")
+    lines.extend(f"- {note}" for note in result_quality_notes(papers))
+    return "\n".join(lines)
+
+
+def validate_paper_object(paper: Any) -> bool:
+    """Validate the expected Paper shape before passing records to renderers."""
+    if not isinstance(paper, Paper):
+        return False
+    if not isinstance(paper.title, str) or not isinstance(paper.authors, tuple):
+        return False
+    if not isinstance(paper.abstract, str) or not isinstance(paper.url, str):
+        return False
+    if not isinstance(paper.categories, tuple):
+        return False
+    return True
+
+
+def validate_paper_collection(papers: Any) -> list[Paper]:
+    """Return only structurally valid Paper objects from an untrusted collection."""
+    if not isinstance(papers, (list, tuple)):
+        return []
+    return [paper for paper in papers if validate_paper_object(paper)]
+
+
+def merge_paper_collections(*collections: list[Paper]) -> list[Paper]:
+    """Merge multiple result collections while preserving first-seen ordering."""
+    merged: list[Paper] = []
+    for collection in collections:
+        merged.extend(validate_paper_collection(collection))
+    return deduplicate_papers(merged)
+
+
+def export_manifest(papers: list[Paper], query: str = "") -> dict[str, Any]:
+    """Describe an export with provenance and counts, without secret values."""
+    return {
+        "application": APP_NAME,
+        "application_version": APP_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "query": normalize_whitespace(query),
+        "source": "OpenAlex",
+        "record_count": len(papers),
+        "result_signature": result_set_signature(papers),
+        "records": compact_result_records(papers),
+        "limitations": [
+            "This export contains only records returned by the current search.",
+            "Missing abstracts or dates are not inferred.",
+            "Metadata completeness is not a quality score.",
+        ],
+    }
+
+
+def search_diagnostics_snapshot() -> dict[str, Any]:
+    """Return safe runtime diagnostics without returning credentials or URLs with keys."""
+    return {
+        "application": APP_NAME,
+        "version": APP_VERSION,
+        "python_version": __import__("sys").version.split()[0],
+        "requests_version": getattr(requests, "__version__", "unknown"),
+        "gradio_version": getattr(gr, "__version__", "unknown"),
+        "openalex_key_configured": bool(OPENALEX_API_KEY),
+        "database_configured": bool(DATABASE_URL),
+        "ai_synthesis_configured": bool(OPENAI_API_KEY and OpenAI is not None),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def format_diagnostics_markdown() -> str:
+    """Render a privacy-safe diagnostics summary for troubleshooting."""
+    data = search_diagnostics_snapshot()
+    rows = ["### Application diagnostics", "", "| Check | Value |", "|---|---|"]
+    for key, value in data.items():
+        label = key.replace("_", " ").capitalize()
+        rows.append(f"| {escape(label)} | {escape(value)} |")
+    rows.extend(["", "No API key values, database credentials, or user search history are included."])
+    return "\n".join(rows)
+
+
+def api_error_guidance(status_code: int | None, response_text: str = "") -> str:
+    """Map common HTTP status codes to actionable, non-secret guidance."""
+    if status_code == 400:
+        return "The provider rejected the query. Try a shorter, simpler search phrase."
+    if status_code == 401:
+        return "The provider did not authenticate the request. Check the server environment variable."
+    if status_code == 403:
+        return "Access was denied. Verify key activation, account access, and API usage policy."
+    if status_code == 404:
+        return "The requested provider endpoint was not found. Check the configured API endpoint."
+    if status_code == 429:
+        return "The provider rate limit was reached. Wait briefly before searching again."
+    if status_code in (500, 502, 503, 504):
+        return "The provider is temporarily unavailable. Retry in a little while."
+    if status_code is None:
+        return "The provider could not be reached. Check connectivity and try again."
+    return "The provider returned an unexpected response. Check server logs for the request details."
+
+
+def retry_delay_seconds(attempt: int, base: float = 0.5, maximum: float = 8.0) -> float:
+    """Calculate capped exponential backoff for custom retry loops."""
+    attempt = bounded_integer(attempt, 0, 0, 12)
+    return min(maximum, max(0.0, base) * (2 ** attempt))
+
+
+def truncate_for_log(value: Any, limit: int = 240) -> str:
+    """Make a bounded single-line diagnostic value safe for application logs."""
+    text = normalize_whitespace(value)
+    text = re.sub(r"(?i)(api_key|authorization|password|secret)=?[^&\s]*", r"\1=[redacted]", text)
+    return text[:max(20, min(limit, 1000))]
+
+
+def build_accessibility_label(paper: Paper) -> str:
+    """Create concise accessible text for a paper card or screen-reader label."""
+    title = normalize_whitespace(paper.title) or "Untitled paper"
+    year = citation_year_label(paper)
+    author = citation_author_label(paper.authors, maximum=2)
+    abstract_state = "abstract available" if paper.abstract.strip() else "abstract unavailable"
+    return f"{title}. {author}. {year}. {abstract_state}."
+
+
+def reading_queue(papers: list[Paper], max_items: int = 20) -> list[dict[str, Any]]:
+    """Create a small reading queue ordered by abstract availability then recency."""
+    limit = bounded_integer(max_items, 20, 1, 100)
+    ordered = sorted(papers, key=lambda p: (bool(p.abstract), p.published or ""), reverse=True)
+    queue = []
+    for index, paper in enumerate(ordered[:limit], 1):
+        queue.append({
+            "position": index,
+            "title": paper.title,
+            "authors": citation_author_label(paper.authors),
+            "year": paper.year,
+            "url": safe_arxiv_url(paper.url),
+            "estimated_abstract_reading_minutes": reading_minutes(paper.abstract),
+            "metadata_completeness_percent": completeness_score(paper),
+        })
+    return queue
+
+
+def bibliography_statistics(papers: list[Paper]) -> dict[str, Any]:
+    """Summarize bibliographic identifiers and fields available for exports."""
+    return {
+        "records": len(papers),
+        "unique_dois": len({normalize_doi(p.doi).casefold() for p in papers if normalize_doi(p.doi)}),
+        "records_without_doi": sum(not normalize_doi(p.doi) for p in papers),
+        "records_without_authors": sum(not p.authors for p in papers),
+        "records_without_abstract": sum(not p.abstract.strip() for p in papers),
+        "records_without_year": sum(p.year is None for p in papers),
+    }
+
+
+def research_diversity_index(papers: list[Paper]) -> float:
+    """Calculate a normalized topic diversity score from source topic labels."""
+    counts = Counter(topic for paper in papers for topic in paper.categories)
+    if len(counts) <= 1:
+        return 0.0
+    total = sum(counts.values())
+    entropy = -sum((count / total) * math.log(count / total) for count in counts.values())
+    return round(entropy / math.log(len(counts)), 4) if total else 0.0
+
+
+def author_overlap(left: Paper, right: Paper) -> float:
+    """Return Jaccard overlap of author names for two paper records."""
+    a, b = set(left.authors), set(right.authors)
+    return jaccard_similarity(a, b)
+
+
+def topic_overlap(left: Paper, right: Paper) -> float:
+    """Return Jaccard overlap of source-provided topic labels."""
+    return jaccard_similarity(set(left.categories), set(right.categories))
+
+
+def explain_similarity(left: Paper, right: Paper) -> str:
+    """Explain simple metadata overlap without presenting it as semantic similarity."""
+    data = compare_metadata(left, right)
+    shared_authors = ", ".join(data["shared_authors"]) or "none listed"
+    shared_topics = ", ".join(data["shared_topics"]) or "none listed"
+    return (f"Title-token overlap: {data['title_similarity']:.0%}. "
+            f"Shared listed authors: {shared_authors}. Shared topics: {shared_topics}. "
+            "This is a metadata comparison, not a scientific assessment.")
+
+
+def export_validation_report(papers: list[Paper]) -> list[str]:
+    """Check a collection before export and return human-readable warnings."""
+    warnings = []
+    if not papers:
+        warnings.append("The export contains no records.")
+        return warnings
+    if len(deduplicate_papers(papers)) != len(papers):
+        warnings.append("Potential duplicate records were detected; review before citation management.")
+    if abstract_coverage(papers) < 100:
+        warnings.append("Some records have no abstract; this is common and does not necessarily indicate an error.")
+    if doi_coverage(papers) < 100:
+        warnings.append("Some records lack a DOI; retain their source URLs for traceability.")
+    if date_coverage(papers) < 100:
+        warnings.append("Some records have no publication year; year charts exclude those records.")
+    return warnings
+
+
+def paper_to_accessible_summary(paper: Paper) -> str:
+    """Build a plain-text, accessible summary of one result record."""
+    fields = [
+        f"Title: {normalize_whitespace(paper.title) or 'Untitled paper'}",
+        f"Authors: {paper.author_text}",
+        f"Publication date: {paper.published or 'Not available'}",
+        f"Topics: {', '.join(paper.categories) if paper.categories else 'Not supplied'}",
+        f"Abstract: {abstract_preview(paper.abstract, 1000) if paper.abstract else 'Not supplied'}",
+        f"DOI: {normalize_doi(paper.doi) if paper.doi else 'Not supplied'}",
+        f"Source: {safe_arxiv_url(paper.url)}",
+    ]
+    return "\n".join(fields)
+
+
+def make_search_audit_record(query: str, field: str, sort: str, limit: Any,
+                             count: int, elapsed_ms: int) -> dict[str, Any]:
+    """Create a minimal non-sensitive audit record for a search operation."""
+    return {
+        "query": normalize_query(query),
+        "field": normalize_whitespace(field)[:40],
+        "sort": normalize_whitespace(sort)[:40],
+        "limit": validate_result_limit(limit),
+        "result_count": bounded_integer(count, 0, 0, MAX_RESULTS),
+        "elapsed_ms": bounded_integer(elapsed_ms, 0, 0, 3_600_000),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def calculate_search_efficiency(count: int, elapsed_ms: int) -> float:
+    """Return records per second for diagnostics, rounded to two decimals."""
+    if elapsed_ms <= 0 or count <= 0:
+        return 0.0
+    return round(count / (elapsed_ms / 1000), 2)
+
+
+def safe_percentage(numerator: int | float, denominator: int | float) -> float:
+    """Calculate a percentage while safely handling zero or invalid denominators."""
+    try:
+        if denominator <= 0:
+            return 0.0
+        return round(100 * float(numerator) / float(denominator), 1)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def abstract_length_statistics(papers: list[Paper]) -> dict[str, float | int]:
+    """Summarize abstract lengths in words without retaining additional text."""
+    lengths = [len(p.abstract.split()) for p in papers if p.abstract.strip()]
+    if not lengths:
+        return {"count": 0, "minimum_words": 0, "maximum_words": 0, "average_words": 0.0, "median_words": 0.0}
+    ordered = sorted(lengths)
+    midpoint = len(ordered) // 2
+    median = float(ordered[midpoint]) if len(ordered) % 2 else (ordered[midpoint - 1] + ordered[midpoint]) / 2
+    return {
+        "count": len(lengths),
+        "minimum_words": min(lengths),
+        "maximum_words": max(lengths),
+        "average_words": round(sum(lengths) / len(lengths), 1),
+        "median_words": round(median, 1),
+    }
+
+
+def topic_year_matrix(papers: list[Paper], top_topics: int = 8) -> dict[str, dict[int, int]]:
+    """Count topic labels by publication year for simple trend visualizations."""
+    topics = [name for name, _count in topic_distribution(papers, top_topics)]
+    matrix: dict[str, dict[int, int]] = {topic: {} for topic in topics}
+    for paper in papers:
+        if paper.year is None:
+            continue
+        for topic in set(paper.categories) & set(topics):
+            matrix[topic][paper.year] = matrix[topic].get(paper.year, 0) + 1
+    return matrix
+
+
+def safe_external_link(value: Any) -> str:
+    """Return an allow-listed HTTPS URL suitable for use in rendered links."""
+    return safe_arxiv_url(normalize_whitespace(value))
+
+
+def normalize_sort_mode(value: Any) -> str:
+    """Normalize a sort option against supported local sorting modes."""
+    allowed = {"Most relevant", "Newest first", "Title A–Z", "Most authors", "Abstract available"}
+    value = normalize_whitespace(value)
+    return value if value in allowed else "Most relevant"
+
+
+def build_export_filename(query: str, extension: str) -> str:
+    """Generate a descriptive but safe filename for downloadable research data."""
+    return safe_filename(query, extension)
+
+
+def app_capabilities() -> list[str]:
+    """List active feature families without implying optional services are enabled."""
+    capabilities = ["OpenAlex scholarly search", "Metadata analytics", "Paper comparison",
+                    "CSV export", "BibTeX export", "RIS export", "JSON export"]
+    if DATABASE_URL:
+        capabilities.append("Optional database-backed bookmarks and history")
+    if OPENAI_API_KEY and OpenAI is not None:
+        capabilities.append("Optional AI-assisted synthesis")
+    return capabilities
+
+
+def capability_report() -> str:
+    """Render available capabilities in a readable, non-secret format."""
+    lines = ["### Feature availability", ""]
+    lines.extend(f"- {escape(capability)}" for capability in app_capabilities())
+    lines.append("\nOptional integrations depend on valid credentials and provider availability.")
+    return "\n".join(lines)
+
+
+def validate_search_inputs(query: Any, field: Any, sort: Any, limit: Any) -> tuple[str, str, str, int]:
+    """Validate all public search controls in one reusable, testable place."""
+    normalized_query = normalize_query(query)
+    if not normalized_query:
+        raise ValueError("Enter a research topic before searching.")
+    allowed_fields = {"All fields", "Title", "Author", "Abstract"}
+    normalized_field = normalize_whitespace(field)
+    if normalized_field not in allowed_fields:
+        normalized_field = "All fields"
+    return normalized_query, normalized_field, normalize_sort_mode(sort), validate_result_limit(limit)
+
+
+def stable_paper_sort_key(paper: Paper) -> tuple[str, str, str]:
+    """Stable secondary key for deterministic local ordering."""
+    return (paper.published or "", paper.title.casefold(), normalize_doi(paper.doi).casefold())
+
+
+def sort_by_publication_date(papers: list[Paper], newest_first: bool = True) -> list[Paper]:
+    """Sort by publication date with deterministic title/DOI tie breakers."""
+    return sorted(papers, key=stable_paper_sort_key, reverse=bool(newest_first))
+
+
+def records_with_missing_fields(papers: list[Paper], field_name: str) -> list[Paper]:
+    """Select records missing a supported bibliographic field."""
+    field_map = {
+        "abstract": lambda p: bool(p.abstract.strip()),
+        "doi": lambda p: bool(normalize_doi(p.doi)),
+        "authors": lambda p: bool(p.authors),
+        "year": lambda p: p.year is not None,
+        "topics": lambda p: bool(p.categories),
+    }
+    if field_name not in field_map:
+        raise ValueError("Supported fields are abstract, doi, authors, year, and topics.")
+    return [paper for paper in papers if not field_map[field_name](paper)]
+
+
+def deduplicated_author_names(papers: list[Paper]) -> list[str]:
+    """Return case-insensitively unique author names in first-seen order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for paper in papers:
+        for author in paper.authors:
+            key = normalize_whitespace(author).casefold()
+            if key and key not in seen:
+                seen.add(key)
+                result.append(normalize_whitespace(author))
+    return result
+
+
+def normalized_category_names(papers: list[Paper]) -> list[str]:
+    """Return unique source-provided category names sorted for display."""
+    return sorted({normalize_whitespace(c) for p in papers for c in p.categories if normalize_whitespace(c)}, key=str.casefold)
+
+
+def paper_title_slug(paper: Paper) -> str:
+    """Create a short title slug for logs or internal labels."""
+    return safe_filename(paper.title, "", max_stem=80).rstrip(".")
+
+
+def citation_key(paper: Paper) -> str:
+    """Generate a deterministic BibTeX-style key from author/year/title."""
+    first_author = paper.authors[0].split()[-1] if paper.authors else "unknown"
+    year = str(paper.year or "nd")
+    title_token = next(iter(title_words(paper)), "paper")
+    return re.sub(r"[^A-Za-z0-9_-]", "", f"{first_author}{year}{title_token}")[:80] or "researchpaper"
+
+
+def reading_priority(paper: Paper) -> tuple[int, int, int]:
+    """A transparent queue priority based on metadata availability and recency."""
+    return (int(bool(paper.abstract.strip())), int(paper.year or 0), len(paper.categories))
+
+
+def rank_reading_queue(papers: list[Paper]) -> list[Paper]:
+    """Rank papers for convenient first-pass reading, not scientific importance."""
+    return sorted(papers, key=reading_priority, reverse=True)
+
+
+def safe_csv_cell(value: Any) -> str:
+    """Reduce spreadsheet formula-injection risk for text exported to CSV."""
+    text = normalize_whitespace(value)
+    if text.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + text
+    return text
+
+
+def source_identifier(paper: Paper) -> str:
+    """Extract the stable OpenAlex work identifier from a supported OpenAlex URL."""
+    url = safe_arxiv_url(paper.url)
+    match = re.search(r"openalex\.org/(W\d+)$", url)
+    return match.group(1) if match else ""
+
+
+def paper_metadata_warnings(paper: Paper) -> list[str]:
+    """Return field-level warnings for one record before a user cites it."""
+    warnings = []
+    if not paper.title.strip() or paper.title == "Untitled paper":
+        warnings.append("Title is missing or generic.")
+    if not paper.authors:
+        warnings.append("No authors are listed in this record.")
+    if not paper.published:
+        warnings.append("Publication date is unavailable.")
+    if not paper.abstract.strip():
+        warnings.append("Abstract is unavailable in the provider record.")
+    if not normalize_doi(paper.doi):
+        warnings.append("DOI is not supplied; verify the source URL.")
+    return warnings
+
+
+def collection_health(papers: list[Paper]) -> dict[str, Any]:
+    """Summarize duplicate and missing-field signals for a collection."""
+    valid = validate_paper_collection(papers)
+    duplicates = duplicate_groups(valid)
+    missing = {field: len(records_with_missing_fields(valid, field))
+               for field in ("abstract", "doi", "authors", "year", "topics")}
+    return {
+        "valid_record_count": len(valid),
+        "duplicate_groups": len(duplicates),
+        "duplicate_records": sum(len(group) for group in duplicates),
+        "missing_field_counts": missing,
+        "metadata_completeness_percent": average_completeness(valid),
+    }
+
+
+def normalize_openalex_id(value: Any) -> str:
+    """Validate and normalize an OpenAlex work ID or URL."""
+    text = normalize_whitespace(value).rstrip("/")
+    match = re.fullmatch(r"(?:https://openalex\.org/)?(W\d+)", text, flags=re.I)
+    return match.group(1).upper() if match else ""
+
+
+def validate_provider_payload(payload: Any) -> tuple[bool, str]:
+    """Validate the basic shape of a provider response without raising errors."""
+    if not isinstance(payload, dict):
+        return False, "The provider response was not a JSON object."
+    if "results" not in payload:
+        return False, "The provider response did not include a results collection."
+    results = payload.get("results")
+    if results is None:
+        return True, "The provider returned no results."
+    if not isinstance(results, list):
+        return False, "The provider results field was not a list."
+    return True, "Provider response structure looks valid."
+
+
+def provider_result_count(payload: Any) -> int:
+    """Return a safe result count from an OpenAlex-like response."""
+    if not isinstance(payload, dict):
+        return 0
+    results = payload.get("results")
+    return len(results) if isinstance(results, list) else 0
+
+
+def robust_json_dumps(value: Any, indent: int = 2) -> str:
+    """Serialize JSON with Unicode preserved and non-finite numbers rejected."""
+    return json.dumps(value, ensure_ascii=False, indent=bounded_integer(indent, 2, 0, 8), allow_nan=False, default=str)
+
+
+def report_timestamp() -> str:
+    """Return an ISO-8601 UTC timestamp for generated reports."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def research_session_summary(query: str, papers: list[Paper], elapsed_ms: int = 0) -> dict[str, Any]:
+    """Combine result summary and runtime into a portable research session object."""
+    return {
+        "query": normalize_whitespace(query),
+        "created_at_utc": report_timestamp(),
+        "elapsed_ms": bounded_integer(elapsed_ms, 0, 0, 3_600_000),
+        "records_per_second": calculate_search_efficiency(len(papers), elapsed_ms),
+        "landscape": result_set_summary(papers),
+        "collection_health": collection_health(papers),
+        "bibliography": bibliography_statistics(papers),
+        "papers": compact_result_records(papers),
+    }
+
+
+# End of research intelligence utilities.
+
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=3, max_size=20).launch(
         server_name="0.0.0.0",
@@ -731,5 +1653,3 @@ if __name__ == "__main__":
         theme=gr.themes.Soft(primary_hue="violet", secondary_hue="pink", neutral_hue="slate"),
         css=CSS,
     )
-
-   
