@@ -138,7 +138,7 @@ def reconstruct_abstract(inverted_index: dict[str, list[int]] | None) -> str:
 
 def parse_openalex(payload: dict[str, Any]) -> list[Paper]:
     papers: list[Paper] = []
-    for item in payload.get("results", []):
+    for item in (payload.get("results") or []):
         if not isinstance(item, dict):
             continue
         title = " ".join(str(item.get("title") or "Untitled paper").split())
@@ -445,6 +445,68 @@ def export_bibtex(papers: list[Paper]):
     return path
 
 
+
+
+def export_json(papers: list[Paper]):
+    """Export normalized paper metadata as a portable JSON file."""
+    if not papers:
+        raise gr.Error("Search for papers before exporting.")
+    path = os.path.join(tempfile.gettempdir(), f"research_data_{int(time.time())}.json")
+    payload = [{
+        "title": p.title, "authors": list(p.authors), "abstract": p.abstract,
+        "published": p.published, "updated": p.updated, "categories": list(p.categories),
+        "doi": p.doi, "url": p.url, "source": "OpenAlex"
+    } for p in papers]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def export_ris(papers: list[Paper]):
+    """Export records in RIS format for reference managers."""
+    if not papers:
+        raise gr.Error("Search for papers before exporting.")
+    path = os.path.join(tempfile.gettempdir(), f"research_refs_{int(time.time())}.ris")
+    rows = []
+    for p in papers:
+        lines = ["TY  - JOUR", f"TI  - {p.title}"]
+        lines.extend(f"AU  - {a}" for a in p.authors)
+        if p.published:
+            lines.append(f"PY  - {p.published[:4]}")
+        if p.doi:
+            lines.append(f"DO  - {p.doi}")
+        if p.abstract:
+            lines.append(f"AB  - {p.abstract.replace(chr(10), ' ')}")
+        if p.url:
+            lines.append(f"UR  - {p.url}")
+        lines.extend(["DB  - OpenAlex", "ER  - ", ""])
+        rows.append("\n".join(lines))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows))
+    return path
+
+
+def source_health() -> str:
+    """Small live diagnostic for the configured scholarly API."""
+    started = time.perf_counter()
+    try:
+        payload = request_openalex({"search": "machine learning", "per-page": 1, "select": "id,display_name"})
+        count = len(payload.get("results", []))
+        ms = int((time.perf_counter() - started) * 1000)
+        return (f"### OpenAlex: reachable\n\n- Test records returned: **{count}**\n"
+                f"- Response time: **{ms} ms**\n- API key configured: **{'yes' if OPENALEX_API_KEY else 'not set'}**")
+    except Exception as exc:
+        log.exception("OpenAlex health check failed")
+        return ("### OpenAlex: unavailable\n\n"
+                f"The test request failed with **{escape(type(exc).__name__)}**. "
+                "Check the newest Render logs; do not share API keys or database credentials.")
+
+
+def quick_topic(topic: str):
+    """Populate a safe, useful example query from a topic chip."""
+    return topic
+
+
 def database_status() -> str:
     if not DATABASE_URL:
         return "Neon is not configured (DATABASE_URL missing). Search and exports can still work."
@@ -513,37 +575,49 @@ def ai_summary(papers: list[Paper], query: str) -> str:
 
 
 CSS = r"""
-.gradio-container{max-width:1240px!important;margin:auto!important}
-#hero{position:relative;overflow:hidden;padding:40px 34px;border-radius:28px;background:radial-gradient(circle at 90% 5%,#6b83ff 0,transparent 34%),linear-gradient(120deg,#10172e,#243a83 62%,#4255c8);color:white;margin:0 0 20px;box-shadow:0 22px 60px #1c2e6428}
-#hero .eyebrow{color:#dce5ff;text-transform:uppercase;letter-spacing:2px;font-size:11px;font-weight:800;margin:0 0 12px}
-#hero h1{color:white;font-size:clamp(31px,5vw,48px);line-height:1.08;margin:0 0 14px;letter-spacing:-1.2px}
-#hero p{color:#e6ecff;line-height:1.8;max-width:780px;margin:0}
-#hero .hero-meta{display:flex;flex-wrap:wrap;gap:9px;margin-top:22px}
-#hero .hero-meta span{font-size:11px;color:white;background:#ffffff18;border:1px solid #ffffff2e;border-radius:999px;padding:7px 10px}
-.search-panel{border:1px solid #e1e7f2;border-radius:22px;padding:22px;background:var(--background-fill-primary)}
-.papers-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:10px}
-.paper-card{min-width:0;padding:22px;border:1px solid #e1e7f0;border-radius:20px;background:var(--background-fill-primary);box-shadow:0 8px 25px #15254b0a;transition:transform .18s ease,box-shadow .18s ease}
-.paper-card:hover{transform:translateY(-2px);box-shadow:0 14px 30px #15254b12}
-.paper-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:13px}
-.index{font-size:10px;font-weight:900;letter-spacing:1.3px;color:#5969e8}
+:root{--ars-ink:#172033;--ars-muted:#667085;--ars-purple:#6941c6;--ars-pink:#e94f9b;--ars-cyan:#19b8c7;--ars-border:#e7e9f4}
+.gradio-container{max-width:1320px!important;margin:auto!important;padding:24px clamp(12px,3vw,34px) 42px!important;background:radial-gradient(ellipse at 4% 0%,rgba(231,79,155,.08),transparent 34%),radial-gradient(ellipse at 96% 9%,rgba(25,184,199,.10),transparent 32%),var(--background-fill-primary)}
+#hero{position:relative;isolation:isolate;overflow:hidden;padding:clamp(28px,5vw,58px);border-radius:30px;background:linear-gradient(120deg,#201447 0%,#5032a4 43%,#8b3ec9 70%,#e94f9b 110%);color:#fff;margin:0 0 24px;box-shadow:0 24px 70px rgba(78,44,151,.23)}
+#hero:before,#hero:after{content:"";position:absolute;z-index:-1;border-radius:50%;pointer-events:none}
+#hero:before{width:340px;height:340px;right:-70px;top:-170px;background:radial-gradient(circle,rgba(255,255,255,.28),rgba(255,255,255,0) 70%)}
+#hero:after{width:280px;height:280px;right:18%;bottom:-225px;border:1px solid #ffffff2e;box-shadow:0 0 0 28px #ffffff09,0 0 0 58px #ffffff07}
+#hero .eyebrow{display:inline-flex;color:#f4eaff;text-transform:uppercase;letter-spacing:2.1px;font-size:11px;font-weight:850;margin:0 0 16px;padding:8px 12px;border:1px solid #ffffff45;background:#ffffff12;border-radius:999px}
+#hero h1{color:#fff;font-size:clamp(34px,5.5vw,58px);line-height:1.04;margin:0 0 16px;letter-spacing:-1.7px;font-weight:850}
+#hero p{color:#f4efff;line-height:1.85;max-width:820px;margin:0;font-size:clamp(14px,1.5vw,17px)}
+#hero .hero-meta{display:flex;flex-wrap:wrap;gap:9px;margin-top:26px}
+#hero .hero-meta span{font-size:11px;color:white;background:#ffffff16;border:1px solid #ffffff35;border-radius:999px;padding:9px 12px;backdrop-filter:blur(8px)}
+.search-panel{border:1px solid var(--ars-border)!important;border-radius:24px!important;padding:clamp(16px,3vw,27px)!important;background:var(--background-fill-primary)!important;box-shadow:0 14px 40px rgba(37,35,84,.06)!important}
+.gradio-container button{border-radius:13px!important;font-weight:750!important;transition:transform .16s ease,box-shadow .16s ease!important}
+.gradio-container button:hover{transform:translateY(-1px)}
+.gradio-container button.primary{background:linear-gradient(100deg,#6841c6,#a13acb 58%,#e94f9b)!important;border:0!important;box-shadow:0 9px 22px rgba(127,60,184,.22)!important}
+.gradio-container input,.gradio-container textarea,.gradio-container select{border-radius:12px!important}
+.gradio-container input:focus,.gradio-container textarea:focus{border-color:#9b67e8!important;box-shadow:0 0 0 3px rgba(155,103,232,.14)!important}
+.gradio-container .accordion{border:1px solid var(--ars-border)!important;border-radius:18px!important;margin-top:14px!important;overflow:hidden}
+.papers-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;margin-top:14px}
+.paper-card{min-width:0;padding:clamp(18px,2vw,25px);border:1px solid var(--ars-border);border-radius:22px;background:var(--background-fill-primary);box-shadow:0 9px 28px rgba(35,30,75,.055);transition:transform .2s ease,box-shadow .2s ease,border-color .2s ease}
+.paper-card:hover{transform:translateY(-3px);border-color:#c9b5f4;box-shadow:0 18px 42px rgba(91,57,151,.12)}
+.paper-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:15px}
+.index{font-size:10px;font-weight:900;letter-spacing:1.2px;color:#7544c7;background:#f2eaff;padding:6px 9px;border-radius:999px}
 .date{font-size:11px;color:var(--body-text-color-subdued)}
-.paper-card h3{font-size:18px;line-height:1.45;margin:0 0 10px;color:var(--body-text-color)}
-.authors{font-size:12px;line-height:1.65;color:var(--body-text-color-subdued);margin-bottom:13px}
-.tag-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:15px}
-.tag{font-size:10px;border-radius:999px;padding:5px 8px;color:#3b4ca7;background:#eef1ff}
-.paper-card details{border-top:1px solid var(--border-color-primary);padding-top:12px}
-.paper-card summary{cursor:pointer;font-size:13px;font-weight:750;color:#6572e9;display:flex;justify-content:space-between}
-.abstract{font-size:13px;line-height:1.8;margin-top:12px;color:var(--body-text-color)}
-.paper-bottom{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-top:17px}
-.paper-bottom a{background:#5367ed;color:#fff!important;text-decoration:none!important;border-radius:10px;padding:10px 13px;font-size:12px;font-weight:800}
+.paper-card h3{font-size:clamp(16px,1.7vw,19px);line-height:1.5;margin:0 0 12px;color:var(--body-text-color);letter-spacing:-.25px}
+.authors{font-size:12px;line-height:1.75;color:var(--body-text-color-subdued);margin-bottom:14px}
+.tag-row{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:16px}
+.tag{font-size:10px;border-radius:999px;padding:6px 9px;color:#5140a2;background:linear-gradient(100deg,#f1eaff,#e8faff);border:1px solid #e7dcff}
+.paper-card details{border-top:1px solid var(--border-color-primary);padding-top:13px}
+.paper-card summary{cursor:pointer;font-size:13px;font-weight:800;color:#8150d2;display:flex;justify-content:space-between;gap:8px}
+.abstract{font-size:13px;line-height:1.9;margin-top:13px;color:var(--body-text-color)}
+.paper-bottom{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-top:19px}
+.paper-bottom a{background:linear-gradient(100deg,#6841c6,#a13acb 65%,#e94f9b);color:#fff!important;text-decoration:none!important;border-radius:12px;padding:11px 15px;font-size:12px;font-weight:850;box-shadow:0 7px 17px rgba(111,64,182,.17)}
+.paper-bottom a:hover{filter:brightness(1.07)}
 .doi{font-size:10px;color:var(--body-text-color-subdued);overflow-wrap:anywhere}
-.empty-state{text-align:center;padding:46px 20px;border:1px dashed #cbd5e6;border-radius:22px;background:var(--background-fill-secondary)}
-.empty-symbol{font-size:38px;color:#6272f0}.empty-state h3{margin:10px 0;color:var(--body-text-color)}.empty-state p{color:var(--body-text-color-subdued);line-height:1.7}
+.empty-state{text-align:center;padding:clamp(32px,6vw,60px) 20px;border:1px dashed #cfc5eb;border-radius:24px;background:linear-gradient(135deg,#faf7ff,#f2fbff)}
+.empty-symbol{font-size:42px;color:#8c55d9}.empty-state h3{margin:12px 0;color:#35215d}.empty-state p{color:#667085;line-height:1.8;max-width:600px;margin:0 auto}
 footer{visibility:hidden}
-@media(max-width:800px){.papers-grid{grid-template-columns:1fr}#hero{padding:29px 21px;border-radius:21px}.paper-card{padding:18px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;scroll-behavior:auto!important}}
+@media(max-width:800px){.gradio-container{padding:12px 10px 28px!important}.papers-grid{grid-template-columns:1fr;gap:13px}#hero{padding:28px 21px;border-radius:23px}.paper-card{padding:18px}.search-panel{border-radius:19px!important}}
 """
 
-with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes.Soft(), css=CSS) as demo:
+with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace") as demo:
     papers_state = gr.State([])
     chosen_state = gr.State([])
     gr.HTML(
@@ -577,11 +651,32 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
         summarize_button = gr.Button("Draft cautious literature snapshot")
         ai_output = gr.Markdown("Search for papers first. Configure the optional AI provider in Render to enable synthesis.")
     with gr.Accordion("Export research", open=False):
+        gr.Markdown("Export your current results for spreadsheets, reference managers, or reproducible analysis.")
         with gr.Row():
             csv_button = gr.Button("Download CSV")
             bib_button = gr.Button("Download BibTeX")
+            ris_button = gr.Button("Download RIS")
+            json_button = gr.Button("Download JSON")
         csv_output = gr.File(label="CSV file")
         bib_output = gr.File(label="BibTeX file")
+        ris_output = gr.File(label="RIS file · Zotero / EndNote")
+        json_output = gr.File(label="JSON file · structured data")
+    with gr.Accordion("API diagnostics", open=False):
+        gr.Markdown("Check whether the live app can reach OpenAlex. This test does not expose your API key.")
+        health_button = gr.Button("Test OpenAlex connection")
+        health_output = gr.Markdown("Connection has not been tested yet.")
+    with gr.Accordion("Try a research topic", open=False):
+        gr.Markdown("Choose a starter topic, then press Explore papers.")
+        with gr.Row():
+            topic_ai = gr.Button("Generative AI")
+            topic_climate = gr.Button("Climate change")
+            topic_health = gr.Button("AI in healthcare")
+            topic_robotics = gr.Button("Robotics")
+        with gr.Row():
+            topic_security = gr.Button("Cybersecurity")
+            topic_energy = gr.Button("Renewable energy")
+            topic_nlp = gr.Button("Natural language processing")
+            topic_bio = gr.Button("Bioinformatics")
     with gr.Accordion("Saved library, search history and health", open=False):
         with gr.Row():
             db_button = gr.Button("Check Neon")
@@ -610,6 +705,15 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
     summarize_button.click(ai_summary, inputs=[papers_state, query], outputs=ai_output)
     csv_button.click(export_csv, inputs=papers_state, outputs=csv_output)
     bib_button.click(export_bibtex, inputs=papers_state, outputs=bib_output)
+    ris_button.click(export_ris, inputs=papers_state, outputs=ris_output)
+    json_button.click(export_json, inputs=papers_state, outputs=json_output)
+    health_button.click(source_health, outputs=health_output)
+    for topic_button, topic_value in [
+        (topic_ai, "generative AI"), (topic_climate, "climate change"),
+        (topic_health, "artificial intelligence healthcare"), (topic_robotics, "robotics"),
+        (topic_security, "cybersecurity"), (topic_energy, "renewable energy"),
+        (topic_nlp, "natural language processing"), (topic_bio, "bioinformatics")]:
+        topic_button.click(lambda value=topic_value: value, outputs=query)
     db_button.click(database_status, outputs=db_output)
     history_button.click(history_text, outputs=history_output)
     library_button.click(load_bookmarks, outputs=library_output)
@@ -617,12 +721,15 @@ with gr.Blocks(title=f"{APP_NAME} | Premium Research Workspace", theme=gr.themes
     def reset_ui():
         return ("", [], "Workspace cleared. Enter a topic to begin.", render_papers([]),
                 "A quantitative overview appears after a successful search.", gr.update(choices=[], value=[]),
-                [], "Select at least two papers.", "", "", None, None)
-    clear_button.click(reset_ui, outputs=[query, papers_state, status, papers_html, analytics, paper_choices, chosen_state, comparison, bookmark_status, ai_output, csv_output, bib_output])
+                [], "Select at least two papers.", "", "", None, None, None, None)
+    clear_button.click(reset_ui, outputs=[query, papers_state, status, papers_html, analytics, paper_choices, chosen_state, comparison, bookmark_status, ai_output, csv_output, bib_output, ris_output, json_output])
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=3, max_size=20).launch(
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", "7860")),
+        theme=gr.themes.Soft(primary_hue="violet", secondary_hue="pink", neutral_hue="slate"),
+        css=CSS,
     )
-      
+
+   
