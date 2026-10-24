@@ -1,5 +1,4 @@
-gradio
-requests
-psycopg[binary]
-
-
+gradio>=5.0,<7.0
+requests>=2.31,<3.0
+psycopg[binary]>=3.2,<4.0
+openai>=1.50,<3.0
